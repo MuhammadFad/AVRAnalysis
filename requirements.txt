@@ -1,0 +1,10 @@
+opencv-python        # image I/O, Gaussian blur, Canny, HSV conversion, contour detection
+scikit-image         # SSIM implementation — the gold standard, way more correct than rolling your own
+numpy                # everything runs on numpy arrays underneath
+scipy                # Bhattacharyya distance for histogram comparison
+matplotlib           # generating the composite output images and heatmaps
+fastapi              # async API layer between pipeline and frontend
+uvicorn              # ASGI server to actually run FastAPI
+python-multipart     # needed for FastAPI to accept file uploads (image pairs)
+streamlit            # frontend UI
+Pillow               # image format handling, loading PNGs cleanly before passing to OpenCV
