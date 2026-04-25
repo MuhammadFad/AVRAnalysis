@@ -1,4 +1,4 @@
-# PixelDelta — Perceptual Image Regression Testing for Game Renders
+# Automated Visual Regression Analysis for 3D Game Scenes
 
 A parallelized computer vision pipeline for automated visual quality assurance of game rendering outputs. Compares a **baseline** (high quality) render against an **optimized** (lower quality) render to detect and quantify perceptual quality regression.
 
