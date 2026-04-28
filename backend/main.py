@@ -41,8 +41,8 @@ def main():
         optimized_path = sys.argv[2]
     else:
         # Default paths for quick testing — put your images here
-        baseline_path  = "images/baseline.png"
-        optimized_path = "images/optimized.png"
+        baseline_path  = "./data/baseline.png"
+        optimized_path = "./data/optimized.png"
 
     # ------------------------------------------------------------------
     #  Setup

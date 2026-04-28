@@ -143,8 +143,7 @@ def save_figure(output_dir: str,
 
     # Divider line
     ax4.axhline(y=0.73, color='#444466', linewidth=0.8,
-                xmin=0.05, xmax=0.95,
-                transform=ax4.transAxes)
+                xmin=0.05, xmax=0.95)
 
     # SSIM metric row
     ssim_status_color = pass_color if ssim_passed else fail_color
@@ -170,8 +169,7 @@ def save_figure(output_dir: str,
 
     # Divider
     ax4.axhline(y=0.37, color='#444466', linewidth=0.8,
-                xmin=0.05, xmax=0.95,
-                transform=ax4.transAxes)
+                xmin=0.05, xmax=0.95)
 
     # Region count
     ax4.text(0.08, 0.31, "Degraded Regions",
@@ -185,8 +183,7 @@ def save_figure(output_dir: str,
 
     # Divider
     ax4.axhline(y=0.15, color='#444466', linewidth=0.8,
-                xmin=0.05, xmax=0.95,
-                transform=ax4.transAxes)
+                xmin=0.05, xmax=0.95)
 
     ax4.text(0.5, 0.07,
              "Visual Regression Analyzer v1.0\nSSIM Phase Report",
