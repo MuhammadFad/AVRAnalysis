@@ -4,7 +4,7 @@ A parallelized computer vision pipeline for automated visual quality assurance o
 
 ---
 
-## 📦 Dataset
+## Dataset
 
 This project does not ship with a dataset. You have two options:
 
@@ -41,7 +41,7 @@ Filenames must match between the two folders (e.g. `shot_01.png` in both).
 
 ---
 
-## ⚙️ Setup
+## Setup
 
 **Requirements:** Python 3.10+
 
@@ -51,4 +51,10 @@ venv\Scripts\activate        # Windows
 source venv/bin/activate     # Linux / macOS
 
 pip install -r requirements.txt
+```
+
+## Running the Project
+
+```bash
+python backend/main.py
 ```

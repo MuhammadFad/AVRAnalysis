@@ -1,119 +1,133 @@
-# =========================================================================
-#  aggregator.py — Heatmap generation and degraded region detection.
+# ================================================================================
+# aggregator.py — Phase 3: Degraded Region Detection & Heatmap Generation
+# ================================================================================
 #
-#  Takes the SSIM map from ssim_pass.py and produces:
-#    1. A false-colour heatmap blended over the optimized image
-#    2. Bounding boxes around significantly degraded regions
+# PURPOSE:
+# This module processes SSIM results to:
+#   1. Visualize regions of visual degradation as a heatmap
+#   2. Detect and localize specific degraded areas using morphological operations
+#   3. Extract bounding boxes around significant degradation hotspots
 #
-#  INPUTS:
-#    img_optimized — float64 [0,1] H x W x 3  — the optimized image
-#    ssim_map      — float64 H x W             — local SSIM scores from Phase 2
-#    params        — dict of config values
+# ROLE IN PIPELINE:
+# This is Phase 3 of the analysis. It receives the per-pixel SSIM map from the
+# SSIM module and transforms it into:
+#   - A visual heatmap (hot colormap: blue=good, red=bad)
+#   - Alpha-blended composite with original image for context
+#   - Bounding boxes around significant degraded regions
 #
-#  OUTPUTS:
-#    composite     — float64 [0,1] H x W x 3  — heatmap blended over image
-#    boxes         — list of [x, y, w, h] bounding boxes (pixel coords)
-# =========================================================================
+# PROCESS OVERVIEW:
+# 1. Invert SSIM map (high SSIM → low degradation, vice versa)
+# 2. Apply 'hot' colormap for visualization
+# 3. Alpha-blend with original image for visual balance
+# 4. Create binary mask of "degraded" pixels (threshold-based)
+# 5. Apply morphological closing to reduce noise
+# 6. Find contours and extract bounding boxes
+# 7. Filter boxes by minimum area to remove trivial artifacts
+#
+# ================================================================================
 
 import numpy as np
 import cv2
-from scipy.ndimage import binary_closing
 import matplotlib
-matplotlib.use('Agg')   # non-interactive backend — safe for scripts
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-
 
 def build_heatmap(img_optimized: np.ndarray, ssim_map: np.ndarray, params: dict):
     """
-    Build the composite heatmap image and detect degraded region bounding boxes.
-
-    Returns:
-        composite_bgr — uint8 BGR image ready for cv2.imwrite()
-        boxes         — list of (x, y, w, h) tuples in pixel coordinates
+    Build visual heatmap and detect degraded regions from SSIM map.
+    
+    This function transforms the per-pixel SSIM scores into a human-interpretable
+    visualization and automatically detects areas of visual degradation.
+    
+    INPUTS:
+        img_optimized: The optimized image (H × W × 3, float64 [0,1])
+        ssim_map: Per-pixel SSIM scores (H × W, float64 [0,1])
+        params: Dictionary with keys:
+            - 'heatmap_alpha': Blend factor between heatmap and image
+            - 'degradation_thresh': Threshold for degradation detection
+            - 'morph_radius': Morphological closing radius (in pixels)
+            - 'min_region_area': Minimum bounding box area (in pixels²)
+    
+    RETURNS:
+        (composite, boxes) tuple:
+        - composite: H × W × 3 float64 image (heatmap + original blended)
+        - boxes: List of (x, y, w, h) bounding boxes around degraded regions
     """
-
-    # ------------------------------------------------------------------
-    #  STEP 1: Build degradation map
-    #
-    #  SSIM map has high values (≈1) where images are similar.
-    #  Invert so high values = high degradation (hot colours on heatmap).
-    #
-    #  degradation = 1 - SSIM_map
-    #  Then clip to [0, 1] to handle any numerical edge cases.
-    # ------------------------------------------------------------------
+    # ========================================================================
+    # STEP 1: Create degradation map
+    # ========================================================================
+    # Invert SSIM: 
+    #   - SSIM = 1.0 (identical) → degradation = 0.0 (none)
+    #   - SSIM = 0.5 (different) → degradation = 0.5 (moderate)
+    #   - SSIM = 0.0 (very different) → degradation = 1.0 (severe)
+    # Clipping to [0,1] handles numerical edge cases
     degradation_map = np.clip(1.0 - ssim_map, 0.0, 1.0)
 
-    # ------------------------------------------------------------------
-    #  STEP 2: Apply 'hot' colormap to degradation map
-    #
-    #  matplotlib's 'hot' colormap:
-    #    0.0 (no degradation) → black
-    #    0.5 (moderate)       → red/orange
-    #    1.0 (max degradation)→ white
-    #
-    #  cm.hot returns RGBA [0,1] — we drop the alpha channel ([:,3]).
-    #  Result: heatmap_rgb is H x W x 3 float64 [0,1]
-    # ------------------------------------------------------------------
-    colormap    = cm.get_cmap('hot')
-    heatmap_rgb = colormap(degradation_map)[:, :, :3]   # drop alpha
+    # ========================================================================
+    # STEP 2: Apply 'hot' colormap for visualization
+    # ========================================================================
+    # 'hot' colormap: Black → Blue → Red → Yellow progression
+    # Maps degradation value to RGB color:
+    #   - 0.0 (no degradation) → Black/dark (good)
+    #   - 0.5 (moderate) → Red (warning)
+    #   - 1.0 (severe) → Yellow/bright (critical)
+    # matplotlib.colormaps['hot'] returns RGBA, we take first 3 channels (RGB)
+    heatmap_rgb = matplotlib.colormaps['hot'](degradation_map)[:, :, :3]
 
-    # ------------------------------------------------------------------
-    #  STEP 3: Alpha-blend heatmap over the optimized image
-    #
-    #  composite = α × heatmap + (1-α) × optimized_image
-    #
-    #  α = heatmap_alpha (0.55 by default) — strong enough to see the
-    #  signal clearly while the scene content remains recognisable.
-    # ------------------------------------------------------------------
-    alpha     = params['heatmap_alpha']
+    # ========================================================================
+    # STEP 3: Alpha-blend heatmap with original image
+    # ========================================================================
+    # Composite = α * heatmap_rgb + (1-α) * img_optimized
+    # This shows degradation locations while preserving image context
+    # α = 0.55 (default): 55% heatmap, 45% original image
+    #   - Higher α: More visible heatmap, less original image context
+    #   - Lower α: Less visible heatmap, more original image visible
+    alpha = params['heatmap_alpha']
     composite = alpha * heatmap_rgb + (1.0 - alpha) * img_optimized
-    composite = np.clip(composite, 0.0, 1.0)
+    composite = np.clip(composite, 0.0, 1.0)  # Ensure values stay in [0,1]
 
-    # ------------------------------------------------------------------
-    #  STEP 4: Detect degraded regions
-    #
-    #  4a. Threshold: pixels above degradation_thresh become 1
-    #  4b. Morphological closing: merges nearby degraded clusters
-    #      structure = disk of given radius
-    #      binary_closing = dilation then erosion
-    #  4c. findContours: finds connected blobs in the binary mask
-    #  4d. boundingRect: gets [x, y, w, h] for each blob
-    #  4e. Filter: discard blobs smaller than min_region_area
-    # ------------------------------------------------------------------
+    # ========================================================================
+    # STEP 4: Create binary mask of degraded regions
+    # ========================================================================
+    # Threshold degradation map: pixels with high degradation → 1 (white)
+    # Default threshold: 0.30 (anything with <70% SSIM is flagged)
+    # This binarization converts continuous values to foreground/background
     binary_mask = (degradation_map > params['degradation_thresh']).astype(np.uint8)
 
-    # Build circular structuring element for morphological closing
-    r    = params['morph_radius']
-    disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*r+1, 2*r+1))
+    # ========================================================================
+    # STEP 5: Morphological closing to reduce noise
+    # ========================================================================
+    # Morphological closing = dilation followed by erosion
+    # Effect: Fills small holes in degraded regions, removes tiny noise spots
+    # Structuring element: Ellipse (circular, less boxy than rectangle)
+    r = params['morph_radius']
+    disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
     closed_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, disk)
+    # Result: Connected regions without small holes or isolated pixels
 
-    # Find contours of connected blobs
-    contours, _ = cv2.findContours(closed_mask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
+    # ========================================================================
+    # STEP 6: Find contours in the closed mask
+    # ========================================================================
+    # Contours are the boundaries of connected components (degraded regions)
+    # RETR_EXTERNAL: Only get outermost contours (ignore holes)
+    # CHAIN_APPROX_SIMPLE: Compress contours (e.g., store only corner points)
+    contours, _ = cv2.findContours(closed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    # ========================================================================
+    # STEP 7: Extract bounding boxes and filter by minimum area
+    # ========================================================================
+    # For each contour, find its bounding rectangle
+    # Filter: only report boxes with area ≥ min_region_area
+    # This removes noise/artifacts and focuses on significant degradations
     boxes = []
     for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area >= params['min_region_area']:
+        # Check if this contour is large enough to report
+        if cv2.contourArea(cnt) > params['min_region_area']:
+            # boundingRect returns (x, y, width, height)
+            # x, y: top-left corner coordinates
+            # width, height: dimensions
             x, y, w, h = cv2.boundingRect(cnt)
             boxes.append((x, y, w, h))
 
-    # ------------------------------------------------------------------
-    #  STEP 5: Draw bounding boxes on the composite image
-    #
-    #  Convert to uint8 first (cv2.rectangle expects uint8).
-    #  Draw red rectangles (BGR: 0, 0, 255) with 3px line width.
-    #  Convert back to float64 for consistent downstream handling.
-    # ------------------------------------------------------------------
-    composite_uint8 = (composite * 255).astype(np.uint8)
-
-    for (x, y, w, h) in boxes:
-        cv2.rectangle(composite_uint8, (x, y), (x+w, y+h),
-                      color=(255, 0, 0),   # RGB red
-                      thickness=3)
-
-    # Convert RGB → BGR for OpenCV saving
-    composite_bgr = cv2.cvtColor(composite_uint8, cv2.COLOR_RGB2BGR)
-
-    return composite_bgr, boxes
+    # ========================================================================
+    # Return composite heatmap and degraded region bounding boxes
+    # ========================================================================
+    return composite, boxes
