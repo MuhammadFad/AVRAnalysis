@@ -1,4 +1,5 @@
-data/
+data/baseline/
+data/optimized/
 output/
 venv/
 __pycache__/
