@@ -6,7 +6,7 @@ A parallelized computer vision pipeline for automated visual quality assurance o
 
 ## Dataset
 
-This project does not ship with a dataset. You have two options:
+There is a sample baseline.png and optimized.png to start working, but this project does not ship with a dataset. You have two options:
 
 ### Option A — GISET (quick start)
 Download the GISET dataset (Gaming Image quality SET):
