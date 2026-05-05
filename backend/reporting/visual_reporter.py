@@ -260,6 +260,9 @@ def save_figure(output_dir: str, img_baseline: np.ndarray, img_optimized: np.nda
             ax.imshow(normalized, cmap='hot')  # Hot colormap: blue (low) → red → yellow (high)
             ax.set_title(f"{label} Component\n({sublabel})", color='white', fontsize=10, pad=6)
             ax.axis('off')
+            # Save component map with proper filename (e.g., luminance_component.png)
+            path = os.path.join(output_dir, f"{label.lower()}_component.png")
+            cv2.imwrite(path, normalized)
 
     # ========================================================================
     # SUMMARY BAR (last row): Key metrics and verdict
