@@ -1,60 +1,102 @@
-# Automated Visual Regression Analysis for 3D Game Scenes
+# Visual Regression Analyzer
 
-A parallelized computer vision pipeline for automated visual quality assurance of game rendering outputs. Compares a **baseline** (high quality) render against an **optimized** (lower quality) render to detect and quantify perceptual quality regression.
+A Python pipeline for comparing a baseline image against an optimized version across three independent quality dimensions — perceptual similarity, structural edge preservation, and color fidelity. Designed for catching visual regressions introduced by rendering optimizations, compression, or post-processing.
 
 ---
 
-## Dataset
+## How it works
 
 There is a sample baseline.png and optimized.png to start working, but this project does not ship with a dataset. You have two options:
 
-### Option A — GISET (quick start)
-Download the GISET dataset (Gaming Image quality SET):
-- Source: https://drive.google.com/open?id=1R2MDH6aNmhZwXFwdHmM91kGIxwR3krf5
-- Place reference frames in `data/baseline/`
-- Place encoded frames in `data/optimized/`
+**SSIM** measures perceptual similarity by comparing local brightness, texture variation, and edge patterns between the two images. It produces a per-pixel score map, detects degraded regions, and tags each region with which other passes also flagged it.
 
-### Option B — UE5 Generated
-Generate your own pairs from Unreal Engine 5:
+**Canny Edge** detects structural edges in both images and measures what fraction of baseline edges are still present in the optimized output. Useful for catching optimizations that silently smooth over fine geometric detail.
 
-1. Open any UE5 project with rich geometry and lighting
-2. Place a `CineCameraActor` at a visually interesting position
-3. Capture a **baseline** render via console:
-```
-sg.ShadowQuality 3
-sg.TextureQuality 3
-sg.PostProcessQuality 3
-r.Lumen.Reflections.Allow 1
-HighResShot 1
-```
-4. Capture the **optimized** render:
-```
-sg.ShadowQuality 0
-sg.TextureQuality 0
-sg.PostProcessQuality 0
-r.Lumen.Reflections.Allow 0
-HighResShot 1
-```
-5. Place output PNGs in the respective `baseline/` and `optimized/` folders
+**Bhattacharyya Color** converts both images to HSV and computes histogram overlap per channel. Catches color grading shifts, saturation changes, and tonemapping differences that the other passes may not surface.
 
-Filenames must match between the two folders (e.g. `shot_01.png` in both).
+Each detected degraded region gets tagged by whichever passes flagged it locally, so the output tells you not just *where* something looks wrong but *why*.
+
+---
+
+## Project structure
+
+```
+root/
+├── main.py                        # Entry point — run from here
+├── data/                          # Place your input images here
+│   ├── baseline.png
+│   └── optimized.png
+├── output/                        # All results written here (auto-created)
+│   ├── regression_report.json     # Machine-readable results for all three passes
+│   ├── heatmap_composite.png      # SSIM heatmap with color-coded region boxes
+│   ├── analysis_figure.png        # Full multi-panel pipeline report
+│   ├── ssim/                      # SSIM component maps (luminance, contrast, structure)
+│   ├── edge/                      # Canny intermediates (Sobel X/Y, NMS, edge maps)
+│   └── color/                     # Bhattacharyya histogram overlay
+└── backend/
+    ├── config.py                  # All tunable parameters live here
+    ├── pipeline/
+    │   ├── acquisition.py         # Image loading and normalization
+    │   ├── ssim_pass.py           # SSIM computation
+    │   ├── edge_pass.py           # Canny edge detection and comparison
+    │   ├── color_pass.py          # Bhattacharyya color distribution comparison
+    │   └── aggregator.py          # Heatmap generation and per-region tagging
+    └── reporting/
+        ├── json_reporter.py       # JSON report serialization
+        └── visual_reporter.py     # PNG figure and heatmap generation
+```
 
 ---
 
 ## Setup
 
-**Requirements:** Python 3.10+
+Requires Python 3.8+.
 
 ```bash
-python -m venv venv
-venv\Scripts\activate        # Windows
-source venv/bin/activate     # Linux / macOS
-
-pip install -r requirements.txt
+pip install numpy opencv-python scipy matplotlib
 ```
 
-## Running the Project
+---
+
+## Usage
 
 ```bash
-python backend/main.py
+python main.py data/baseline.png data/optimized.png
 ```
+
+If no arguments are provided it defaults to `data/baseline.png` and `data/optimized.png`.
+
+---
+
+## Output
+
+**`regression_report.json`** — structured results for all three passes, including per-region bounding boxes with a `filters` list indicating which passes flagged each one.
+
+**`heatmap_composite.png`** — the SSIM degradation heatmap with color-coded bounding boxes:
+
+| Box color | Meaning |
+|---|---|
+| 🟡 Yellow | SSIM only — perceptual diff, edges and color OK |
+| 🟠 Orange | SSIM + Edge — structural detail also lost |
+| 🔵 Blue | SSIM + Color — color profile also shifted |
+| 🔴 Red | All three — fully degraded region |
+
+**`analysis_figure.png`** — a multi-panel report showing the input images, SSIM component maps, Canny edge maps, and a summary sidebar with all three pass scores and verdicts.
+
+**`output/ssim/`**, **`output/edge/`**, **`output/color/`** — intermediate diagnostic images for each pass, written when `SAVE_INTERMEDIATES = True` in `config.py`.
+
+---
+
+## Configuration
+
+All thresholds and tunable parameters are centralized in `backend/config.py`. Nothing is hardcoded elsewhere.
+
+Key parameters:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `SSIM_THRESHOLD` | `0.90` | Minimum acceptable SSIM score |
+| `CANNY_EDGE_MATCH_THRESH` | `0.85` | Minimum fraction of baseline edges to preserve |
+| `COLOR_DISTANCE_THRESH` | `0.30` | Maximum acceptable Bhattacharyya distance |
+| `SAVE_INTERMEDIATES` | `True` | Whether to write per-pass diagnostic images |
+| `DEGRADATION_THRESH` | `0.30` | SSIM map sensitivity for region detection |

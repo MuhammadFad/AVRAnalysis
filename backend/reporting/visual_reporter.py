@@ -3,22 +3,46 @@
 # ================================================================================
 #
 # PURPOSE:
-# This module generates publication-quality visual reports showing the
-# complete analysis pipeline and results. Outputs include:
-#   1. Heatmap composite: SSIM heatmap overlaid on optimized image with boxes
-#   2. Analysis figure: Multi-panel comparison (baseline, optimized, heatmap, components)
+# This module generates publication-quality visual reports covering all three
+# analysis passes (SSIM, edge, color). Outputs include:
+#
+#   1. heatmap_composite.png
+#      SSIM heatmap with color-coded bounding boxes, cause labels burned onto
+#      each box, and a legend. Self-explanatory at a glance — no separate figure
+#      needed to understand what each region means.
+#
+#   2. analysis_figure.png
+#      Multi-panel report with four columns:
+#        Col 0-2 (image panels, stacked rows):
+#          Row 0: Baseline | Optimized | SSIM heatmap (with annotated boxes)
+#          Row 1: Lost edges diff map | SSIM structure component | SSIM contrast component
+#          Row 2: Color histogram overlay (spanning all 3 cols)  [if available]
+#        Col 3 (sidebar, spans all rows):
+#          Overall verdict + per-pass score cards + top-N degraded region breakdown
+#          with hypothesis in plain English
+#
+# DESIGN CHOICES vs the original:
+#   - Removed: separate luminance component panel (least actionable of the three)
+#   - Removed: side-by-side edge maps (replaced by lost-edges diff which is more
+#     informative — you can immediately see *what* was lost, not just that edges exist)
+#   - Added: cause label text drawn on/near each bounding box on the heatmap
+#   - Added: per-region breakdown in sidebar — top N regions, worst-first, with
+#     their cause hypothesis, confidence badge, and local scores
+#   - Added: color histogram panel in analysis figure (was only in separate file)
+#
+# BOUNDING BOX COLOR CODING:
+# Each detected region is drawn with a color reflecting which filters flagged it:
+#   🟡 Yellow (255, 220, 0)  — SSIM only          (perceptual diff, edges/color OK)
+#   🟠 Orange (255, 140, 0)  — SSIM + Edge        (structural detail also lost)
+#   🔵 Blue   (30,  144, 255) — SSIM + Color       (color profile also shifted)
+#   🔴 Red    (220, 30,  30)  — All three          (fully degraded region)
 #
 # ROLE IN PIPELINE:
-# This is the visual reporting component. It receives analysis results and
-# creates PNG images suitable for:
-#   - Developers/QA engineers (visual inspection)
-#   - Reports and dashboards
-#   - Build artifacts (CI/CD)
-#   - Stakeholder communication
-#
-# OUTPUT FILES:
-#   - heatmap_composite.png: 2D heatmap with bounding boxes
-#   - analysis_figure.png: Multi-panel detailed analysis figure
+# Receives the fully assembled namespaced results dict from main.py and writes:
+#   output/heatmap_composite.png  — heatmap with cause-labelled boxes and legend
+#   output/analysis_figure.png    — full multi-panel pipeline report
+#   output/ssim/                  — SSIM component maps (L, C, S)
+#   output/edge/                  — Edge intermediates (Sobel X/Y, NMS, edge maps)
 #
 # ================================================================================
 
@@ -26,292 +50,663 @@ import os
 import numpy as np
 import cv2
 import matplotlib
-matplotlib.use('Agg')  # Headless backend (no GUI windows needed)
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 
-def _normalize_cs(arr: np.ndarray) -> np.ndarray:
+
+# ================================================================================
+# Box color scheme — shared between heatmap and figure
+# ================================================================================
+
+def _box_color(passes_failed: list) -> tuple:
     """
-    Normalize array to [0, 1] range using min-max normalization.
-    
-    Linear stretching: value_normalized = (value - min) / (max - min)
-    This is a simple but sometimes insufficient normalization (see _normalize_he).
-    
-    INPUTS:
-        arr: Input array (any shape)
-    
-    RETURNS:
-        Normalized array in [0, 1] range, or all-zeros if array is constant
+    Return the RGB draw color for a bounding box given its failed-pass list.
+
+    Color encodes which combination of passes flagged this region:
+        SSIM only            → Yellow  (mildest — only perceptual score failed)
+        SSIM + Edge          → Orange  (structure also broken)
+        SSIM + Color         → Blue    (color profile also shifted)
+        SSIM + Edge + Color  → Red     (all dimensions degraded)
+
+    SSIM is always present since boxes are SSIM-derived.
     """
-    lo, hi = np.min(arr), np.max(arr)
-    # If all values are the same (hi == lo), return zeros
-    if hi > lo:
-        return (arr - lo) / (hi - lo)
-    return np.zeros_like(arr)
+    failed   = set(passes_failed)
+    has_edge  = 'edge'  in failed
+    has_color = 'color' in failed
+
+    if has_edge and has_color:
+        return (220, 30,  30)    # Red    — all three
+    if has_edge:
+        return (255, 140,  0)    # Orange — SSIM + Edge
+    if has_color:
+        return (30,  144, 255)   # Blue   — SSIM + Color
+    return (255, 220,   0)       # Yellow — SSIM only
+
+
+# Legend entries for the heatmap and figure (RGB, label)
+_LEGEND_ENTRIES = [
+    ((255, 220,   0), "SSIM only"),
+    ((255, 140,   0), "SSIM + Edge"),
+    ((30,  144, 255), "SSIM + Color"),
+    ((220,  30,  30), "SSIM + Edge + Color"),
+]
+
+# Confidence badge colors for the sidebar region breakdown (matplotlib color strings)
+_CONFIDENCE_COLORS = {
+    "clean":      "#00c853",
+    "low":        "#90caf9",
+    "medium":     "#ffe082",
+    "high":       "#ff9800",
+    "very_high":  "#ff5722",
+    "definitive": "#b71c1c",
+}
+
+
+# ================================================================================
+# Internal normalization helpers
+# ================================================================================
 
 def _normalize_he(arr: np.ndarray) -> np.ndarray:
     """
     Enhanced normalization using CLAHE for better contrast and visibility.
-    
-    CLAHE (Contrast Limited Adaptive Histogram Equalization) is more effective
-    than simple linear normalization for displaying subtle SSIM component maps.
-    It applies histogram equalization locally to enhance contrast while avoiding
-    over-saturation ("contrast limiting").
-    
+
+    CLAHE (Contrast Limited Adaptive Histogram Equalization) applies histogram
+    equalization tile-by-tile with a clip limit, enhancing local contrast for
+    visualization without over-amplifying noise.
+
     INPUTS:
-        arr: Input array (H × W, float64)
-    
+        arr: H × W float64 array
+
     RETURNS:
-        Enhanced uint8 array [0, 255] suitable for visualization
+        H × W uint8 array [0, 255]
     """
-    # ====================================================================
-    # STEP 1: Initial linear stretch to 0-255 range
-    # ====================================================================
     lo, hi = np.min(arr), np.max(arr)
-    # If all values are the same, return zeros (nothing to enhance)
     if hi <= lo:
         return np.zeros_like(arr, dtype=np.uint8)
-    
-    # Min-max normalization to [0, 255] range for OpenCV
     rescaled = ((arr - lo) / (hi - lo) * 255).astype(np.uint8)
-    
-    # ====================================================================
-    # STEP 2: Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    # ====================================================================
-    # Traditional histogram equalization can over-amplify noise.
-    # CLAHE applies histogram equalization locally (tile-by-tile) with limits,
-    # resulting in better contrast for visualization without artifacts.
-    #   - clipLimit=2.0: Contrast amplification limit (0.0=no enhancement, higher=more)
-    #   - tileGridSize=(8,8): Divide image into 8×8 tiles for local processing
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(rescaled)
-    
-    return enhanced
+    clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(rescaled)
 
-def save_heatmap(output_dir: str, composite: np.ndarray, boxes: list) -> str:
+
+def _float_to_uint8(arr: np.ndarray) -> np.ndarray:
+    """Convert float64 [0,1] image to uint8 [0,255]."""
+    return (np.clip(arr, 0.0, 1.0) * 255).astype(np.uint8)
+
+
+# ================================================================================
+# Intermediate savers — called from main.py when save_intermediates=True
+# ================================================================================
+
+def save_ssim_intermediates(ssim_dir: str, ssim_result: dict) -> None:
     """
-    Save heatmap composite with bounding boxes as PNG file.
-    
-    This creates a simple visualization showing:
-    - The SSIM heatmap (colors indicate degradation severity)
-    - Bounding boxes around detected degraded regions
-    
+    Save SSIM component maps (luminance, contrast, structure) as PNG files.
+
+    Each component highlights a different reason for visual degradation,
+    making it easier to diagnose which perceptual dimension failed.
+
     INPUTS:
-        output_dir: Directory where PNG will be saved
-        composite: H × W × 3 heatmap image (float64 [0,1])
-        boxes: List of (x, y, w, h) bounding box tuples
-    
-    RETURNS:
-        str: File path where PNG was written
-    
-    OUTPUT FILE:
-        {output_dir}/heatmap_composite.png
-        8-bit RGB PNG image with bounding boxes
+        ssim_dir:    Path to the SSIM output subdirectory (output/ssim/)
+        ssim_result: Dictionary returned by ssim_pass.run()
+                     Must contain 'l_map', 'c_map', 's_map'.
     """
-    # ========================================================================
-    # Convert composite from float64 [0,1] to uint8 [0,255] for PNG
-    # ========================================================================
-    composite_uint8 = (np.clip(composite, 0.0, 1.0) * 255).astype(np.uint8)
+    for arr, name in [(ssim_result.get("l_map"), "luminance"),
+                      (ssim_result.get("c_map"), "contrast"),
+                      (ssim_result.get("s_map"), "structure")]:
+        if arr is not None:
+            cv2.imwrite(os.path.join(ssim_dir, f"{name}_component.png"),
+                        _normalize_he(arr))
 
-    # ========================================================================
-    # Draw bounding boxes on the composite
-    # ========================================================================
-    # Blue boxes (255, 0, 0 in RGB = (0, 0, 255) in BGR for cv2) indicate degraded regions
-    # Thickness=3: 3-pixel wide rectangle border (visible but not too intrusive)
-    for (x, y, w, h) in boxes:
-        # cv2.rectangle draws on image in-place
-        # Coordinates: top-left (x, y) to bottom-right (x+w, y+h)
-        cv2.rectangle(composite_uint8, (x, y), (x + w, y + h), color=(255, 0, 0), thickness=3)
 
-    # ========================================================================
-    # Convert RGB to BGR for cv2.imwrite (OpenCV uses BGR byte order)
-    # ========================================================================
-    composite_bgr = cv2.cvtColor(composite_uint8, cv2.COLOR_RGB2BGR)
-    
-    # ========================================================================
-    # Write PNG file
-    # ========================================================================
+def save_edge_intermediates(edge_dir: str, edge_result: dict) -> None:
+    """
+    Save Canny edge pass intermediate images for diagnostic inspection.
+
+    Saved files:
+      - sobel_x.png:        Horizontal gradient magnitude (absolute value)
+      - sobel_y.png:        Vertical gradient magnitude (absolute value)
+      - nms_map.png:        Gradient after non-maximum suppression
+      - edge_baseline.png:  Final Canny edge map for the baseline image
+      - edge_optimized.png: Final Canny edge map for the optimized image
+
+    INPUTS:
+        edge_dir:    Path to the edge output subdirectory (output/edge/)
+        edge_result: Dictionary returned by edge_pass.run()
+    """
+    for key, filename in [('sobel_x', 'sobel_x.png'), ('sobel_y', 'sobel_y.png')]:
+        arr = edge_result.get(key)
+        if arr is not None:
+            cv2.imwrite(os.path.join(edge_dir, filename),
+                        _normalize_he(np.abs(arr)))
+
+    nms = edge_result.get("nms_map")
+    if nms is not None:
+        cv2.imwrite(os.path.join(edge_dir, "nms_map.png"), _normalize_he(nms))
+
+    for key, filename in [('edge_baseline',  'edge_baseline.png'),
+                           ('edge_optimized', 'edge_optimized.png')]:
+        arr = edge_result.get(key)
+        if arr is not None:
+            cv2.imwrite(os.path.join(edge_dir, filename), arr * 255)
+
+
+# ================================================================================
+# Heatmap annotation helpers
+# ================================================================================
+
+def _draw_legend(img_uint8: np.ndarray) -> np.ndarray:
+    """
+    Burn a color-coded filter legend into the bottom-left corner of an image.
+
+    The legend maps box colors to their filter combination meaning, making
+    the heatmap self-explanatory without needing a separate figure.
+
+    INPUTS:
+        img_uint8: H × W × 3 uint8 image to annotate in-place
+
+    RETURNS:
+        The same array with the legend drawn on it
+    """
+    font       = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.65
+    thickness  = 2
+    pad        = 14
+    swatch_w   = 22
+    swatch_h   = 18
+    line_h     = 28
+
+    max_text_w = max(
+        cv2.getTextSize(label, font, font_scale, thickness)[0][0]
+        for _, label in _LEGEND_ENTRIES
+    )
+
+    panel_w = swatch_w + pad + max_text_w + pad * 2
+    panel_h = len(_LEGEND_ENTRIES) * line_h + pad * 2
+
+    H, W = img_uint8.shape[:2]
+    x0   = pad
+    y0   = H - panel_h - pad
+
+    # Semi-transparent dark background panel
+    overlay = img_uint8.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h),
+                  (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.65, img_uint8, 0.35, 0, img_uint8)
+
+    for i, (color_rgb, label) in enumerate(_LEGEND_ENTRIES):
+        row_y     = y0 + pad + i * line_h
+        swatch_x1 = x0 + pad
+        swatch_y1 = row_y
+        swatch_x2 = swatch_x1 + swatch_w
+        swatch_y2 = swatch_y1 + swatch_h
+
+        bgr = (color_rgb[2], color_rgb[1], color_rgb[0])
+        cv2.rectangle(img_uint8, (swatch_x1, swatch_y1),
+                      (swatch_x2, swatch_y2), bgr, -1)
+
+        text_x = swatch_x2 + pad // 2
+        text_y = swatch_y1 + swatch_h - 2
+        cv2.putText(img_uint8, label, (text_x, text_y),
+                    font, font_scale, (230, 230, 230), thickness, cv2.LINE_AA)
+
+    return img_uint8
+
+
+def _draw_boxes_with_labels(img_uint8:       np.ndarray,
+                             combined_regions: list,
+                             box_thickness:   int = 3) -> np.ndarray:
+    """
+    Draw color-coded bounding boxes and cause-tag labels onto the heatmap.
+
+    Each box is drawn in the color corresponding to its pass combination.
+    A short cause tag (e.g. "blocking artifact", "texture loss") is burned
+    above or below the box so the image is interpretable without a separate
+    report.
+
+    Label placement logic:
+      - Preferred: above the box (offset upward by label height + padding)
+      - Fallback:  inside the box top edge (if box is too close to image top)
+
+    INPUTS:
+        img_uint8:        H × W × 3 uint8 image
+        combined_regions: Enriched region dicts from combinator (must have
+                          'bbox', 'passes_failed', 'cause_tag')
+        box_thickness:    Rectangle stroke width in pixels
+
+    RETURNS:
+        The same array with boxes and labels drawn on it
+    """
+    font       = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.55
+    thickness  = 2
+    pad        = 5
+    H, W       = img_uint8.shape[:2]
+
+    for region in combined_regions:
+        x, y, w, h   = region["bbox"]
+        color_rgb     = _box_color(region["passes_failed"])
+        bgr           = (color_rgb[2], color_rgb[1], color_rgb[0])
+        tag           = region.get("cause_tag", "")
+
+        # Draw the bounding box
+        cv2.rectangle(img_uint8, (x, y), (x + w, y + h), bgr, box_thickness)
+
+        if not tag:
+            continue
+
+        # Measure the label text so we can position and back-fill it cleanly
+        (tw, th), baseline = cv2.getTextSize(tag, font, font_scale, thickness)
+        label_h = th + baseline + pad * 2
+
+        # Place label above box if there is room, otherwise place inside top edge
+        if y - label_h >= 0:
+            label_y0 = y - label_h
+            text_y   = y - pad - baseline
+        else:
+            label_y0 = y
+            text_y   = y + th + pad
+
+        label_x0 = max(0, x)
+        label_x1 = min(W, x + tw + pad * 2)
+        label_y1 = label_y0 + label_h
+
+        # Semi-transparent filled background behind label text
+        overlay = img_uint8.copy()
+        cv2.rectangle(overlay, (label_x0, label_y0), (label_x1, label_y1), bgr, -1)
+        cv2.addWeighted(overlay, 0.70, img_uint8, 0.30, 0, img_uint8)
+
+        # White label text
+        cv2.putText(img_uint8, tag, (label_x0 + pad, text_y),
+                    font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+    return img_uint8
+
+
+# ================================================================================
+# Main output writers
+# ================================================================================
+
+def save_heatmap(output_dir:      str,
+                 composite:       np.ndarray,
+                 combined_regions: list) -> str:
+    """
+    Save the SSIM heatmap composite with color-coded bounding boxes, cause labels,
+    and a filter legend.
+
+    Each box is drawn with a color reflecting which combination of passes (SSIM,
+    edge, color) flagged that region. A short cause tag is burned above each box
+    for at-a-glance interpretation. A legend is burned into the bottom-left corner.
+
+    INPUTS:
+        output_dir:       Root output directory
+        composite:        H × W × 3 float64 heatmap image
+        combined_regions: Enriched region dicts from combinator
+
+    RETURNS:
+        str: File path where the PNG was written
+    """
+    img = _float_to_uint8(composite)
+    img = _draw_boxes_with_labels(img, combined_regions)
+    img = _draw_legend(img)
+
     path = os.path.join(output_dir, "heatmap_composite.png")
-    cv2.imwrite(path, composite_bgr)
+    cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
     return path
 
-def save_figure(output_dir: str, img_baseline: np.ndarray, img_optimized: np.ndarray, composite: np.ndarray, results: dict) -> str:
+
+def save_figure(output_dir:       str,
+                img_baseline:     np.ndarray,
+                img_optimized:    np.ndarray,
+                composite:        np.ndarray,
+                results:          dict) -> str:
     """
     Generate and save a comprehensive multi-panel analysis figure.
-    
-    This creates a publication-quality figure showing:
-    - Row 1: Baseline image, optimized image, SSIM heatmap composite
-    - Row 2 (optional): Luminance, contrast, structure SSIM components
-    - Row 3: Summary metrics (verdict, score, degraded region count)
-    
+
+    LAYOUT:
+      Col 0-2  |  Col 3 (sidebar)
+      ---------+--------------------------
+      Row 0:   Baseline | Optimized | SSIM heatmap (annotated)   │ Overall verdict
+      Row 1:   Lost edges | SSIM structure | SSIM contrast        │ Pass score cards
+      Row 2:   Color histograms (H, S, V) spanning cols 0-2      │ Top-N regions
+      Footer:  Full-width footer bar
+
+    Removed vs original:
+      - Luminance component (least actionable SSIM sub-map)
+      - Side-by-side raw edge maps (replaced by lost-edges diff — shows *what* was lost)
+    Added vs original:
+      - Cause labels on heatmap boxes
+      - Color histogram panel integrated into main figure
+      - Per-region breakdown in sidebar (top N, worst-first)
+
     INPUTS:
-        output_dir: Directory where PNG will be saved
-        img_baseline: Baseline image (H × W × 3, float64 [0,1])
-        img_optimized: Optimized image (H × W × 3, float64 [0,1])
-        composite: SSIM heatmap composite (H × W × 3, float64 [0,1])
-        results: Dictionary with keys:
-            - ssim_score: Overall SSIM value
-            - ssim_passed: Boolean pass/fail
-            - boxes: Bounding boxes of degraded regions
-            - params: Configuration parameters
-            - l_map, c_map, s_map: Component maps (optional)
-    
+        output_dir:    Root output directory
+        img_baseline:  H × W × 3 float64 baseline image
+        img_optimized: H × W × 3 float64 optimized image
+        composite:     H × W × 3 float64 SSIM heatmap composite
+        results:       Namespaced results dict from main.py:
+                           results['ssim']   → ssim pass result + boxes (enriched)
+                           results['edge']   → edge pass result
+                           results['color']  → color pass result
+                           results['params'] → flat config dict
+
     RETURNS:
-        str: File path where PNG was written
-    
-    OUTPUT FILE:
-        {output_dir}/analysis_figure.png
-        High-resolution figure (20 inches wide, 8-12 inches tall, 150 DPI)
+        str: File path where the PNG was written
     """
-    # ========================================================================
-    # Extract results and parameters
-    # ========================================================================
-    ssim_score = results["ssim_score"]
-    ssim_passed = results["ssim_passed"]
-    boxes = results["boxes"]
-    params = results["params"]
-    l_map = results.get("l_map")  # Luminance component (or None)
-    c_map = results.get("c_map")  # Contrast component (or None)
-    s_map = results.get("s_map")  # Structure component (or None)
+    ssim_r  = results["ssim"]
+    edge_r  = results["edge"]
+    color_r = results["color"]
+    params  = results["params"]
 
-    # Check if SSIM component maps are available
-    # If not saved, figure will have 2 rows; if saved, 3 rows
-    has_components = all(m is not None for m in [l_map, c_map, s_map])
-    n_rows = 3 if has_components else 2
+    combined_regions = ssim_r.get("boxes", [])
 
-    # ========================================================================
-    # Figure styling and layout setup
-    # ========================================================================
-    # Dark theme with accent colors for professional appearance
-    panel_bg = '#e0e0e0'      # Light gray for panel backgrounds
-    title_color = '#16213e'   # Dark blue for titles
-    metric_color = '#90caf9'  # Light blue for metric labels
-    pass_color = '#00c853'    # Green for PASS
-    fail_color = '#ff1744'    # Red for FAIL
+    # ---- Unpack optional maps ----
+    c_map = ssim_r.get("c_map")
+    s_map = ssim_r.get("s_map")
+    has_ssim_detail = c_map is not None and s_map is not None
 
-    # Determine verdict and color
-    verdict = "PASS" if ssim_passed else "FAIL"
-    verdict_color = pass_color if ssim_passed else fail_color
+    edge_baseline  = edge_r.get("edge_baseline")
+    edge_optimized = edge_r.get("edge_optimized")
+    has_edge_maps  = edge_baseline is not None and edge_optimized is not None
 
-    # Adjust figure height based on whether component maps are included
-    fig_height = 12 if has_components else 8
-    
-    # Create figure with GridSpec layout
-    # Layout: n_rows × 3 columns, where:
-    #   - Row 0: baseline | optimized | heatmap
-    #   - Row 1: luminance | contrast | structure (if has_components)
-    #   - Row n_rows-1: summary metrics (spanning all 3 columns)
-    fig = plt.figure(figsize=(20, fig_height), facecolor='#1a1a2e')
-    gs = GridSpec(n_rows, 3, figure=fig, hspace=0.40, wspace=0.25, left=0.04, right=0.97, top=0.92, bottom=0.06)
+    has_histograms = bool(color_r.get("histograms"))
 
-    # Main title
-    fig.suptitle("Visual Regression Analyzer — SSIM Analysis Report", color='white', fontsize=15, fontweight='bold', y=0.96)
+    # ---- Determine row layout ----
+    # Row 0 always present (baseline / optimized / heatmap)
+    # Row 1: SSIM detail + lost edges  (if edge maps + SSIM components available)
+    # Row 2: Color histograms          (if histogram data available)
+    n_img_rows = 1 + int(has_ssim_detail and has_edge_maps) + int(has_histograms)
+    n_rows     = n_img_rows + 1    # +1 for footer
 
-    # ========================================================================
-    # ROW 0: Image comparison (baseline, optimized, heatmap)
-    # ========================================================================
-    # Prepare heatmap with bounding boxes
-    composite_uint8 = (np.clip(composite, 0.0, 1.0) * 255).astype(np.uint8)
-    for (x, y, w, h) in boxes:
-        # Draw blue boxes around detected degradations
-        cv2.rectangle(composite_uint8, (x, y), (x + w, y + h), color=(255, 0, 0), thickness=3)
+    # ---- Styling ----
+    bg_dark      = '#1a1a2e'
+    bg_panel     = '#16213e'
+    metric_color = '#90caf9'
+    pass_color   = '#00c853'
+    fail_color   = '#ff1744'
 
-    # Panel 1: Baseline image (reference/original quality)
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.imshow(img_baseline)
-    ax1.set_title("Original (Baseline)", color='white', fontsize=10, pad=6)
-    ax1.axis('off')  # Hide axes (no ticks, no labels)
+    def vc(passed): return pass_color if passed else fail_color
+    def vs(passed): return "PASS ✓" if passed else "FAIL ✗"
 
-    # Panel 2: Optimized image (what we're testing)
-    ax2 = fig.add_subplot(gs[0, 1])
-    ax2.imshow(img_optimized)
-    ax2.set_title("Optimized", color='white', fontsize=10, pad=6)
-    ax2.axis('off')
+    all_passed = ssim_r["passed"] and edge_r["passed"] and color_r["passed"]
 
-    # Panel 3: SSIM heatmap composite with degradation boxes
-    ax3 = fig.add_subplot(gs[0, 2])
-    ax3.imshow(composite_uint8)
-    ax3.set_title(f"SSIM Heatmap ({len(boxes)} degraded region(s))", color='white', fontsize=10, pad=6)
-    ax3.axis('off')
+    fig_height = max(10, 4 * n_img_rows)
+    fig = plt.figure(figsize=(26, fig_height), facecolor=bg_dark)
+
+    height_ratios = [1] * n_img_rows + [0.07]
+    gs = GridSpec(
+        n_rows, 4, figure=fig,
+        width_ratios=[1, 1, 1, 1.15],
+        height_ratios=height_ratios,
+        hspace=0.38, wspace=0.16,
+        left=0.02, right=0.99, top=0.93, bottom=0.04,
+    )
+
+    fig.suptitle(
+        "Visual Regression Analyzer — Full Pipeline Report",
+        color='white', fontsize=15, fontweight='bold', y=0.97,
+    )
+
+    current_row = 0
 
     # ========================================================================
-    # ROW 1: SSIM component maps (optional, only if saved during computation)
+    # ROW 0: Baseline | Optimized | SSIM heatmap (annotated boxes + labels)
     # ========================================================================
-    # Each component shows a different aspect of perceived similarity:
-    # - Luminance: Are brightness levels similar?
-    # - Contrast: Are texture variations similar?
-    # - Structure: Are edge patterns in the same places?
-    if has_components:
-        components = [
-            (l_map, "Luminance", "Brightness similarity"),
-            (c_map, "Contrast", "Texture similarity"),
-            (s_map, "Structure", "Pattern correlation")
-        ]
-        for col, (arr, label, sublabel) in enumerate(components):
-            ax = fig.add_subplot(gs[1, col])
+    # Build annotated heatmap — same as heatmap_composite but without the
+    # burned-in legend (the matplotlib legend handles that here).
+    heatmap_uint8 = _float_to_uint8(composite)
+    heatmap_uint8 = _draw_boxes_with_labels(heatmap_uint8, combined_regions)
 
-            # ==================================================================
-            # PERFORM NORMALIZATION HERE
-            # ==================================================================
-            # Use CLAHE normalization for better visual contrast
-            normalized = _normalize_he(arr)
+    ax = fig.add_subplot(gs[current_row, 0])
+    ax.imshow(img_baseline)
+    ax.set_title("Baseline (reference)", color='white', fontsize=9, pad=5)
+    ax.axis('off')
 
-            ax.imshow(normalized, cmap='hot')  # Hot colormap: blue (low) → red → yellow (high)
-            ax.set_title(f"{label} Component\n({sublabel})", color='white', fontsize=10, pad=6)
-            ax.axis('off')
+    ax = fig.add_subplot(gs[current_row, 1])
+    ax.imshow(img_optimized)
+    ax.set_title("Optimized (test)", color='white', fontsize=9, pad=5)
+    ax.axis('off')
 
-    # ========================================================================
-    # SUMMARY BAR (last row): Key metrics and verdict
-    # ========================================================================
-    ax_s = fig.add_subplot(gs[n_rows - 1, :])  # Spans all 3 columns
-    ax_s.set_facecolor('#16213e')  # Dark blue background
-    ax_s.axis('off')  # No axis ticks or labels
+    ax = fig.add_subplot(gs[current_row, 2])
+    ax.imshow(heatmap_uint8)
+    ax.set_title(
+        f"SSIM Degradation Heatmap  ({len(combined_regions)} region(s) detected)",
+        color='white', fontsize=9, pad=5,
+    )
+    ax.axis('off')
+    # Matplotlib legend for box color scheme (cleaner than burned-in legend here)
+    legend_patches = [
+        mpatches.Patch(color=tuple(c / 255 for c in rgb), label=label)
+        for rgb, label in _LEGEND_ENTRIES
+    ]
+    ax.legend(handles=legend_patches, loc='lower left',
+              fontsize=7, facecolor=bg_panel, edgecolor='#444466',
+              labelcolor='white', framealpha=0.88)
 
-    # --------
-    # Section 1: OVERALL VERDICT
-    # --------
-    ax_s.text(0.08, 0.92, "OVERALL VERDICT", transform=ax_s.transAxes, ha='left', va='top', 
-              color='white', fontsize=11, fontweight='bold')
-    ax_s.text(0.08, 0.72, verdict, transform=ax_s.transAxes, ha='left', va='top', 
-              color=verdict_color, fontsize=32, fontweight='bold', fontfamily='monospace')
-
-    # --------
-    # Section 2: SSIM SCORE DETAILS
-    # --------
-    ax_s.text(0.30, 0.92, "SSIM Score", transform=ax_s.transAxes, 
-              color=metric_color, fontsize=10, fontfamily='monospace')
-    ax_s.text(0.30, 0.72, f"{ssim_score:.4f}", transform=ax_s.transAxes, 
-              color='white', fontsize=20, fontweight='bold', fontfamily='monospace')
-    ax_s.text(0.30, 0.56, f"Threshold: {params['ssim_threshold']}", transform=ax_s.transAxes, 
-              color='#888888', fontsize=9, fontfamily='monospace')
-    ax_s.text(0.30, 0.46, "PASS ✓" if ssim_passed else "FAIL ✗", transform=ax_s.transAxes, 
-              color=verdict_color, fontsize=11, fontweight='bold', fontfamily='monospace')
-
-    # --------
-    # Section 3: DEGRADED REGIONS COUNT
-    # --------
-    ax_s.text(0.52, 0.92, "Degraded Regions", transform=ax_s.transAxes, 
-              color=metric_color, fontsize=10, fontfamily='monospace')
-    ax_s.text(0.52, 0.72, str(len(boxes)), transform=ax_s.transAxes, 
-              color='white', fontsize=32, fontweight='bold', fontfamily='monospace')
-    ax_s.text(0.52, 0.46, "detected" if boxes else "none found", transform=ax_s.transAxes, 
-              color='#888888', fontsize=9, fontfamily='monospace')
-
-    # --------
-    # Footer: Report metadata
-    # --------
-    ax_s.text(0.5, 0.08, "Visual Regression Analyzer v1.0 | SSIM Phase Report", 
-              transform=ax_s.transAxes, ha='center', color='#555577', fontsize=7, fontfamily='monospace')
+    current_row += 1
 
     # ========================================================================
-    # Save figure to PNG file
+    # ROW 1: Lost edges diff | SSIM structure | SSIM contrast
     # ========================================================================
+    # Showing *lost* edges (baseline ∩ ¬optimized) is more informative than
+    # side-by-side edge maps: you immediately see what structural detail was
+    # removed rather than having to mentally diff two full maps.
+    if has_ssim_detail and has_edge_maps:
+        lost_edges = edge_baseline & ~edge_optimized
+
+        ax = fig.add_subplot(gs[current_row, 0])
+        ax.imshow(lost_edges, cmap='hot')
+        ax.set_title(
+            f"Lost Edges  (match {edge_r['score']:.1%})\n"
+            "baseline edges absent in optimized",
+            color='white', fontsize=9, pad=5,
+        )
+        ax.axis('off')
+
+        ax = fig.add_subplot(gs[current_row, 1])
+        ax.imshow(_normalize_he(s_map), cmap='hot')
+        ax.set_title(
+            "SSIM — Structure Component\nlocal edge-pattern correlation",
+            color='white', fontsize=9, pad=5,
+        )
+        ax.axis('off')
+
+        ax = fig.add_subplot(gs[current_row, 2])
+        ax.imshow(_normalize_he(c_map), cmap='hot')
+        ax.set_title(
+            "SSIM — Contrast Component\nlocal texture-variation similarity",
+            color='white', fontsize=9, pad=5,
+        )
+        ax.axis('off')
+
+        current_row += 1
+
+    # ========================================================================
+    # ROW 2: Color histograms (H, S, V) — spans all 3 image columns
+    # ========================================================================
+    # Integrating the histogram into the main figure avoids the reader having
+    # to open a separate file to see the color distribution comparison.
+    if has_histograms:
+        histograms = color_r["histograms"]
+        distances  = color_r["distances"]
+
+        channel_meta = {
+            'H': {'label': 'Hue',        'color_b': '#f48fb1', 'color_o': '#f06292', 'x_max': 180},
+            'S': {'label': 'Saturation', 'color_b': '#80cbc4', 'color_o': '#26a69a', 'x_max': 256},
+            'V': {'label': 'Value',      'color_b': '#ffe082', 'color_o': '#ffca28', 'x_max': 256},
+        }
+
+        for col, (name, (p_base, p_opt)) in enumerate(histograms.items()):
+            ax = fig.add_subplot(gs[current_row, col])
+            ax.set_facecolor(bg_panel)
+
+            meta   = channel_meta[name]
+            n_bins = len(p_base)
+            x      = np.linspace(0, meta['x_max'], n_bins)
+
+            ax.fill_between(x, p_base, alpha=0.45, color=meta['color_b'], label='Baseline')
+            ax.plot(x, p_base, color=meta['color_b'], linewidth=1.5)
+            ax.fill_between(x, p_opt,  alpha=0.45, color=meta['color_o'], label='Optimized')
+            ax.plot(x, p_opt,  color=meta['color_o'], linewidth=1.5)
+
+            dist_ok = distances[name] <= params['color_distance_thresh']
+            ax.set_title(
+                f"{meta['label']} — Bhattacharyya: {distances[name]:.4f}  "
+                f"{'✓' if dist_ok else '✗'}",
+                color='white', fontsize=9, pad=5,
+            )
+            ax.set_xlabel("Pixel Value",  color='#aaaaaa', fontsize=8)
+            ax.set_ylabel("Probability",  color='#aaaaaa', fontsize=8)
+            ax.tick_params(colors='#888888', labelsize=7)
+            for spine in ax.spines.values():
+                spine.set_edgecolor('#333355')
+            ax.legend(facecolor=bg_dark, edgecolor='#333355',
+                      labelcolor='white', fontsize=8)
+
+        current_row += 1
+
+    # ========================================================================
+    # SIDEBAR (col 3, spans all image rows): verdict + scores + region breakdown
+    # ========================================================================
+    ax_s = fig.add_subplot(gs[0:n_img_rows, 3])
+    ax_s.set_facecolor(bg_panel)
+    ax_s.axis('off')
+
+    y = 0.98
+
+    def _label(text, dy=0.042):
+        nonlocal y
+        ax_s.text(0.07, y, text, transform=ax_s.transAxes,
+                  color=metric_color, fontsize=8, fontfamily='monospace', va='top')
+        y -= dy
+
+    def _value(text, color='white', size=18, dy=0.095):
+        nonlocal y
+        ax_s.text(0.07, y, text, transform=ax_s.transAxes,
+                  color=color, fontsize=size, fontweight='bold',
+                  fontfamily='monospace', va='top')
+        y -= dy
+
+    def _subtext(text, color='#888888', dy=0.036):
+        nonlocal y
+        ax_s.text(0.07, y, text, transform=ax_s.transAxes,
+                  color=color, fontsize=7.5, fontfamily='monospace', va='top')
+        y -= dy
+
+    def _spacer(dy=0.022):
+        nonlocal y
+        y -= dy
+
+    def _divider(dy=0.028):
+        nonlocal y
+        ax_s.axhline(y=y + 0.01, xmin=0.04, xmax=0.96,
+                     color='#333355', linewidth=0.8)
+        y -= dy
+
+    # ---- Overall verdict ----
+    _label("OVERALL VERDICT", dy=0.038)
+    _value("PASS" if all_passed else "FAIL", color=vc(all_passed), size=26, dy=0.11)
+    _divider()
+
+    # ---- SSIM score card ----
+    _label("SSIM  (perceptual similarity)", dy=0.038)
+    _value(f"{ssim_r['score']:.4f}", dy=0.082)
+    _subtext(f"threshold ≥ {params['ssim_threshold']}", dy=0.030)
+    _value(vs(ssim_r['passed']), color=vc(ssim_r['passed']), size=10, dy=0.050)
+    _divider()
+
+    # ---- Edge score card ----
+    _label("Edge Match  (Canny)", dy=0.038)
+    _value(f"{edge_r['score']:.4f}", dy=0.082)
+    _subtext(f"threshold ≥ {params['canny_edge_match_thresh']}", dy=0.030)
+    _value(vs(edge_r['passed']), color=vc(edge_r['passed']), size=10, dy=0.050)
+    _divider()
+
+    # ---- Color score card ----
+    _label("Color  (Bhattacharyya distance)", dy=0.038)
+    _value(f"{color_r['score']:.4f}", dy=0.082)
+    _subtext(
+        f"H={color_r['distances']['H']:.3f}  "
+        f"S={color_r['distances']['S']:.3f}  "
+        f"V={color_r['distances']['V']:.3f}",
+        dy=0.030,
+    )
+    _subtext(f"threshold ≤ {params['color_distance_thresh']}", dy=0.030)
+    _value(vs(color_r['passed']), color=vc(color_r['passed']), size=10, dy=0.050)
+    _divider()
+
+    # ---- Per-region breakdown (top N, worst SSIM first) ----
+    top_n = params.get('top_regions_in_report', 5)
+
+    # Sort by local SSIM ascending (lowest SSIM = worst degradation)
+    sorted_regions = sorted(
+        combined_regions,
+        key=lambda r: r['local_scores']['ssim'] if r['local_scores']['ssim'] is not None else 1.0,
+    )[:top_n]
+
+    if sorted_regions:
+        _label(f"TOP {len(sorted_regions)} DEGRADED REGIONS  (worst first)", dy=0.038)
+        _spacer(0.008)
+
+        for i, region in enumerate(sorted_regions):
+            local      = region['local_scores']
+            conf       = region.get('confidence', '')
+            hypothesis = region.get('cause_hypothesis', '')
+            tag        = region.get('cause_tag', '')
+            x, y_r, w, h = region['bbox']
+            conf_color = _CONFIDENCE_COLORS.get(conf, 'white')
+
+            # Region index + bbox
+            _subtext(f"#{i+1}  bbox ({x},{y_r}) {w}×{h}px", color='#cccccc', dy=0.028)
+
+            # Cause tag + confidence badge on same line
+            _subtext(f"  {tag}  [{conf}]", color=conf_color, dy=0.028)
+
+            # Local scores
+            ssim_s  = f"{local['ssim']:.3f}"  if local['ssim']  is not None else "n/a"
+            edge_s  = f"{local['edge']:.3f}"  if local['edge']  is not None else "n/a"
+            color_s = f"{local['color']:.3f}" if local['color'] is not None else "n/a"
+            _subtext(f"  ssim={ssim_s}  edge={edge_s}  color={color_s}",
+                     color='#888888', dy=0.028)
+
+            # Hypothesis — word-wrapped to ~38 chars to fit the sidebar panel.
+            words     = hypothesis.split()
+            lines_out = []
+            line_buf  = ""
+            for word in words:
+                if len(line_buf) + len(word) + 1 <= 38:
+                    line_buf = (line_buf + " " + word).strip()
+                else:
+                    if line_buf:
+                        lines_out.append(line_buf)
+                    line_buf = word
+            if line_buf:
+                lines_out.append(line_buf)
+            for ln in lines_out:
+                ax_s.text(0.10, y, f"  {ln}", transform=ax_s.transAxes,
+                          color='#aaaaaa', fontsize=7, fontfamily='monospace',
+                          va='top', style='italic')
+                y -= 0.026
+            _spacer(0.012)
+
+    # ========================================================================
+    # FOOTER ROW: spans all 4 columns
+    # ========================================================================
+    ax_f = fig.add_subplot(gs[n_img_rows, :])
+    ax_f.set_facecolor('#12122a')
+    ax_f.axis('off')
+    ax_f.text(
+        0.5, 0.5,
+        "Visual Regression Analyzer  |  SSIM · Canny Edge · Bhattacharyya Color  |  "
+        "Artifacts: blocking, ringing, banding, mosquito noise",
+        transform=ax_f.transAxes, ha='center', va='center',
+        color='#555577', fontsize=8, fontfamily='monospace',
+    )
+
     path = os.path.join(output_dir, "analysis_figure.png")
-    # Settings:
-    #   - dpi=150: High resolution (150 dots per inch)
-    #   - bbox_inches='tight': Remove whitespace around figure
-    #   - facecolor: Use the figure's background color
     fig.savefig(path, dpi=150, bbox_inches='tight', facecolor=fig.get_facecolor())
-    plt.close(fig)  # Close figure to free memory
+    plt.close(fig)
     return path
+
+
+
