@@ -29,7 +29,7 @@ SSIM_THRESHOLD = 0.90
 # SSIM_WINDOW_SIZE: Size of the Gaussian kernel for local SSIM computation
 #   - Larger values (e.g., 21): Looks at broader regions, catches large-scale degradation
 #   - Smaller values (e.g., 5): Sensitive to fine details, catches subtle differences
-#   - Default 11: Good balance for game rendering analysis
+#   - Default 11: Good balance for video compression analysis
 SSIM_WINDOW_SIZE = 11
 
 # SSIM_SIGMA: Standard deviation of the Gaussian kernel
@@ -52,12 +52,11 @@ HEATMAP_ALPHA = 0.55
 #   - 0.30: Moderate; catches noticeable quality differences
 #   - 0.40: Stricter; only flags significant degradation
 #   - 0.20: Looser; flags even minor differences
-#   High values (0.3-0.4) avoid detecting compression artifacts as true degradation
 DEGRADATION_THRESH = 0.30
 
 # MORPH_RADIUS: Radius of morphological operations for post-processing (in pixels)
 #   - Applied to binary degradation mask to close small holes and reduce noise
-#   - Default 15: Effective for typical game render resolutions
+#   - Default 15: Effective for typical video frame resolutions
 #   - Larger values: More "smoothing", loses fine detail
 #   - Smaller values: Preserves detail, keeps fragmented regions
 MORPH_RADIUS = 15
@@ -131,6 +130,28 @@ COLOR_SPACE = 'HSV'
 #   - Default 0.3: Allows minor color shifts while flagging significant changes
 #   - Tune down (e.g., 0.1) for strict color fidelity requirements
 COLOR_DISTANCE_THRESH = 0.3
+
+# ============================
+# Aggregator & Combinator Parameters
+# ============================
+# These parameters govern spatial region clustering (aggregator) and the
+# semantic cause-hypothesis logic (combinator).
+
+# IOU_THRESHOLD: Intersection-over-Union threshold for region co-location.
+#   Currently used as the minimum IoU for considering two regions from
+#   different passes as referring to the same degraded area. Kept for
+#   future use when edge/color passes gain independent spatial detection.
+#   - 0.3: Lenient — regions don't need perfect overlap, just co-location.
+#           This is intentional: different passes detect slightly different
+#           extents of the same underlying artifact.
+#   - Higher: Requires tighter spatial agreement before merging
+#   - Lower:  Merges regions that are merely nearby, not truly overlapping
+IOU_THRESHOLD = 0.3
+
+# TOP_REGIONS_IN_REPORT: How many degraded regions to surface in the visual
+# report's summary sidebar, ranked by severity (ascending local SSIM score).
+#   - 5: Shows the five worst regions — enough context without clutter
+TOP_REGIONS_IN_REPORT = 5
 
 # ============================
 # Debug & Intermediate Output

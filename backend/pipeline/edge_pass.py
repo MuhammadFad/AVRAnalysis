@@ -344,8 +344,9 @@ def run(img_baseline: np.ndarray, img_optimized: np.ndarray, params: dict) -> di
     # Assemble result dictionary
     # ========================================================================
     result = {
-        "score":          score,
-        "passed":         passed,
+        "score":          score,                        # Edge match fraction [0,1]
+        "passed":         passed,                       # Bool: score ≥ threshold
+        "verdict":        "PASS" if passed else "FAIL", # Human-readable verdict
         "edge_baseline":  edge_baseline,
         "edge_optimized": edge_optimized,
     }

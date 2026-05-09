@@ -203,9 +203,13 @@ def run(img1: np.ndarray, img2: np.ndarray, params: dict) -> dict:
     # ========================================================================
     # STEP 6: Build result dictionary
     # ========================================================================
+    passed = score >= params['ssim_threshold']
+
     result = {
-        "score":    score,     # Scalar: overall SSIM
-        "ssim_map": ssim_map,  # H×W: per-pixel SSIM values
+        "score":    score,                        # Scalar: overall SSIM
+        "passed":   passed,                       # Bool: score ≥ threshold
+        "verdict":  "PASS" if passed else "FAIL", # Human-readable verdict
+        "ssim_map": ssim_map,                     # H×W: per-pixel SSIM values
     }
 
     # Component maps are useful for diagnosing which perceptual dimension caused

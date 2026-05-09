@@ -210,8 +210,9 @@ def run(img_baseline: np.ndarray, img_optimized: np.ndarray, params: dict) -> di
     # Assemble result dictionary
     # ========================================================================
     result = {
-        "score":     score,
-        "passed":    passed,
+        "score":     score,                        # Mean Bhattacharyya distance
+        "passed":    passed,                       # Bool: score ≤ threshold
+        "verdict":   "PASS" if passed else "FAIL", # Human-readable verdict
         "distances": distances,
     }
 

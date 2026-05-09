@@ -5,12 +5,11 @@
 #
 # OVERVIEW:
 # This module orchestrates the complete visual regression analysis pipeline.
-# It coordinates five sequential phases to compare baseline and optimized images,
-# detect visual degradation across three independent dimensions, and generate
-# comprehensive reports.
+# It coordinates six sequential phases to compare baseline and optimized images,
+# detect visual degradation across three independent dimensions, assign semantic
+# cause hypotheses to each degraded region, and generate comprehensive reports.
 #
 # PIPELINE ARCHITECTURE:
-# The analysis consists of five phases, each handled by a dedicated module:
 #
 #   Phase 1: ACQUISITION (pipeline/acquisition.py)
 #   ├─ Load baseline (high-quality reference) and optimized (test) images
@@ -22,31 +21,40 @@
 #   ├─ Phase 2a: SSIM (pipeline/ssim_pass.py)
 #   │   ├─ Compute Structural Similarity Index Measure (perceptual similarity)
 #   │   ├─ Generate per-pixel SSIM map and component maps (L, C, S)
-#   │   └─ Returns overall score and per-pixel map
+#   │   └─ Returns score, verdict, and per-pixel map
 #   │
 #   ├─ Phase 2b: EDGE (pipeline/edge_pass.py)
 #   │   ├─ Run Canny edge detection on both images
 #   │   ├─ Compute edge match score (fraction of baseline edges preserved)
-#   │   └─ Returns score, edge maps, and optional intermediates
+#   │   └─ Returns score, verdict, and edge maps (reused by aggregator)
 #   │
 #   └─ Phase 2c: COLOR (pipeline/color_pass.py)
 #       ├─ Compute HSV color histograms for both images
 #       ├─ Compute per-channel Bhattacharyya distances
-#       └─ Returns mean distance score and histogram data
+#       └─ Returns score, verdict, and histogram data
 #
 #   Phase 3: AGGREGATION (pipeline/aggregator.py)
 #   ├─ Create visual heatmap from SSIM scores
-#   ├─ Detect degraded regions using morphological operations
-#   └─ Return alpha-blended composite and bounding box list
+#   ├─ Detect degraded regions using morphological operations on the SSIM map
+#   ├─ For each region, compute local scores using already-computed maps:
+#   │     SSIM local:  slice of ssim_map (free — no re-computation)
+#   │     Edge local:  slice of edge_baseline/edge_optimized (free — no re-computation)
+#   │     Color local: re-run histogram on cropped region (necessary)
+#   └─ Return composite image + list of structured combined region dicts
 #
-#   Phase 4: REPORTING — STRUCTURED (reporting/json_reporter.py)
-#   ├─ Serialize all three pass results to machine-readable JSON
+#   Phase 4: COMBINATION (pipeline/combinator.py)
+#   ├─ Apply truth table to each region's pass attribution
+#   ├─ Assign cause hypothesis and confidence per region
+#   └─ Pure function — no image ops, no spatial math
+#
+#   Phase 5: REPORTING — STRUCTURED (reporting/json_reporter.py)
+#   ├─ Serialize all pass results and enriched regions to machine-readable JSON
 #   └─ Enable CI/CD integration and automated testing
 #
-#   Phase 5: REPORTING — VISUAL (reporting/visual_reporter.py)
+#   Phase 6: REPORTING — VISUAL (reporting/visual_reporter.py)
 #   ├─ Save per-pass intermediate images to their respective subdirectories
-#   ├─ Generate SSIM heatmap composite with bounding boxes
-#   └─ Generate multi-panel analysis figure covering all three passes
+#   ├─ Generate SSIM heatmap composite with cause-labelled bounding boxes
+#   └─ Generate multi-panel analysis figure with per-region breakdown sidebar
 #
 # USAGE:
 #   From the project root:
@@ -59,9 +67,9 @@
 #
 # OUTPUT ARTIFACTS:
 #   output/
-#   ├─ regression_report.json     — Machine-readable results (all three passes)
-#   ├─ heatmap_composite.png      — SSIM heatmap with bounding boxes
-#   ├─ analysis_figure.png        — Full multi-panel pipeline report
+#   ├─ regression_report.json     — Machine-readable results (all passes + regions)
+#   ├─ heatmap_composite.png      — SSIM heatmap with cause-labelled region boxes
+#   ├─ analysis_figure.png        — Full multi-panel pipeline report with sidebar
 #   ├─ ssim/                      — SSIM component maps (L, C, S)
 #   ├─ edge/                      — Edge intermediates (Sobel X/Y, NMS, edge maps)
 #   └─ color/                     — Bhattacharyya histogram overlay
@@ -81,6 +89,7 @@ from backend.pipeline.ssim_pass     import run as run_ssim
 from backend.pipeline.edge_pass     import run as run_edge
 from backend.pipeline.color_pass    import run as run_color, save_histogram_overlay
 from backend.pipeline.aggregator    import build_heatmap
+from backend.pipeline.combinator    import combine as combine_regions
 from backend.reporting.json_reporter   import save as save_json
 from backend.reporting.visual_reporter import (
     save_heatmap,
@@ -131,6 +140,9 @@ def main():
         # Color
         "color_hist_bins":           config.COLOR_HIST_BINS,
         "color_distance_thresh":     config.COLOR_DISTANCE_THRESH,
+        # Combinator / reporting
+        "iou_threshold":             config.IOU_THRESHOLD,
+        "top_regions_in_report":     config.TOP_REGIONS_IN_REPORT,
         # Global
         "save_intermediates":        config.SAVE_INTERMEDIATES,
     }
@@ -151,7 +163,8 @@ def main():
     print("\n[Phase 2a] Computing SSIM...")
     ssim_result = run_ssim(img_baseline, img_optimized, params)
     ssim_passed = ssim_result["score"] >= config.SSIM_THRESHOLD
-    ssim_result["passed"] = ssim_passed
+    ssim_result["passed"]  = ssim_passed
+    ssim_result["verdict"] = "PASS" if ssim_passed else "FAIL"
 
     print(f"  >> Score     : {ssim_result['score']:.4f}")
     print(f"  >> Threshold : {config.SSIM_THRESHOLD}")
@@ -181,25 +194,51 @@ def main():
     print(f"  >> Result        : {'PASS ✓' if color_result['passed'] else 'FAIL ✗'}")
 
     # ========================================================================
-    # Phase 3: Aggregation (SSIM heatmap + region detection)
+    # Phase 3: Aggregation
     # ========================================================================
+    # Pass the already-computed edge maps into the aggregator so local edge
+    # scores are derived by slicing those maps — no redundant Canny re-runs.
     print("\n[Phase 3] Building heatmap and detecting degraded regions...")
-    composite, boxes = build_heatmap(img_baseline, img_optimized, ssim_result["ssim_map"], params)
-    ssim_result["boxes"] = boxes
-    print(f"  >> Degraded regions: {len(boxes)}")
+    composite, combined_regions = build_heatmap(
+        img_baseline,
+        img_optimized,
+        ssim_result["ssim_map"],
+        edge_result.get("edge_baseline"),
+        edge_result.get("edge_optimized"),
+        params,
+    )
+    print(f"  >> Degraded regions detected: {len(combined_regions)}")
+
+    # ========================================================================
+    # Phase 4: Combination — semantic cause hypothesis per region
+    # ========================================================================
+    print("\n[Phase 4] Applying combinator truth table...")
+    enriched_regions = combine_regions(
+        combined_regions,
+        ssim_thresh=config.SSIM_THRESHOLD,
+        edge_thresh=config.CANNY_EDGE_MATCH_THRESH,
+        color_thresh=config.COLOR_DISTANCE_THRESH,
+    )
+    for region in enriched_regions:
+        x, y, w, h = region['bbox']
+        print(f"  >> Region ({x},{y}) {w}×{h}px  "
+              f"[{region['confidence']}]  {region['cause_tag']}")
+
+    # Attach enriched regions to ssim_result so reporters find them at results["ssim"]["boxes"]
+    ssim_result["boxes"] = enriched_regions
 
     # ========================================================================
     # Assemble namespaced results dictionary
     # ========================================================================
     results = {
-        "ssim":  ssim_result,
-        "edge":  edge_result,
-        "color": color_result,
+        "ssim":   ssim_result,
+        "edge":   edge_result,
+        "color":  color_result,
         "params": params,
     }
 
     # ========================================================================
-    # Phase 4 & 5: Reporting
+    # Phase 5 & 6: Reporting
     # ========================================================================
     print("\n[Reporting] Saving outputs...")
 
@@ -211,7 +250,7 @@ def main():
         print(f"  >> Histogram overlay : {hist_path}")
 
     # --- Main outputs ---
-    heatmap_path = save_heatmap(config.OUTPUT_DIR, composite, boxes)
+    heatmap_path = save_heatmap(config.OUTPUT_DIR, composite, enriched_regions)
     print(f"  >> Heatmap           : {heatmap_path}")
 
     json_path = save_json(config.OUTPUT_DIR, results)

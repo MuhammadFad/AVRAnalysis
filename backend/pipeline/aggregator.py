@@ -1,34 +1,48 @@
 # ================================================================================
-# aggregator.py — Phase 3: Degraded Region Detection & Multi-Pass Tagging
+# aggregator.py — Phase 3: Degraded Region Detection & Spatial Attribution
 # ================================================================================
 #
 # PURPOSE:
 # This module processes SSIM results to:
 #   1. Visualize regions of visual degradation as a heatmap
 #   2. Detect and localize specific degraded areas using morphological operations
-#   3. For each detected region, run localized edge and color checks to determine
-#      which of the three analysis passes flagged it as degraded
-#   4. Return tagged bounding boxes that carry per-region filter attribution
+#   3. For each detected region, compute per-pass local scores using already-
+#      computed maps (no redundant re-runs of Canny or SSIM)
+#   4. Return structured combined regions tagged with which passes fired locally
 #
 # ROLE IN PIPELINE:
-# This is Phase 3 of the analysis. It receives the per-pixel SSIM map, the
-# full-image edge and color results, and both original images. It produces:
-#   - A visual heatmap (hot colormap: dark=good, yellow=bad)
-#   - Alpha-blended composite with original image for context
-#   - Tagged bounding boxes: each box knows which filters flagged it
+# This is Phase 3 of the analysis. It receives:
+#   - The per-pixel SSIM map (from ssim_pass)
+#   - The already-computed edge maps (from edge_pass) — sliced, not re-run
+#   - The color pass params (color is re-run locally — no dense spatial map exists)
+#   - Both original images (for local color crops)
+# It produces:
+#   - A visual heatmap (hot colormap: dark=good, yellow=bright=bad)
+#   - A list of structured combined region dicts (consumed by combinator.py)
 #
-# TAGGING LOGIC:
-# SSIM flags a region by definition — boxes only exist because SSIM detected
-# degradation there. Edge and color are then evaluated *within that crop*:
-#   - Edge:  compute local edge match score for the cropped region
-#   - Color: compute local Bhattacharyya distance for the cropped region
-# If either exceeds its threshold, that filter's tag is added to the box.
+# DESIGN NOTE — Why SSIM is the region anchor:
+#   SSIM produces a dense per-pixel similarity map, making it the natural source
+#   for spatial region detection. Edge and color passes produce only global scalars.
+#   For each SSIM-detected region we then evaluate edge and color *locally*:
+#     - Edge local score:  slice already-computed edge_baseline / edge_optimized maps
+#                          → zero extra Canny computation
+#     - SSIM local score:  slice already-computed ssim_map
+#                          → zero extra SSIM computation
+#     - Color local score: re-run histogram on the crop
+#                          → unavoidable; no dense color spatial map exists
+#   Future work (FYP): add independent spatial detection to edge (lost-edge contours)
+#   and color (tile-grid Bhattacharyya), then IoU-cluster all three region lists.
 #
-# BOX COLOR MEANING (rendered by visual_reporter.py):
-#   Yellow — SSIM only          (perceptual diff, structure/color OK)
-#   Orange — SSIM + Edge        (structure also broken)
-#   Blue   — SSIM + Color       (color profile also shifted)
-#   Red    — All three          (fully degraded region)
+# OUTPUT SCHEMA — each combined region dict:
+#   {
+#     "bbox":         (x, y, w, h),       # pixel coords in original image space
+#     "passes_failed": ["ssim", "edge"],  # which passes fired for this region
+#     "local_scores":  {                  # per-pass local quality scores
+#         "ssim":  float,                 # mean SSIM in crop (lower = worse)
+#         "edge":  float | None,          # edge match score in crop (lower = worse)
+#         "color": float | None,          # mean Bhattacharyya distance in crop
+#     }
+#   }
 #
 # ================================================================================
 
@@ -36,36 +50,43 @@ import numpy as np
 import cv2
 import matplotlib
 
-from backend.pipeline.edge_pass  import run as run_edge
 from backend.pipeline.color_pass import run as run_color
 
 
 def build_heatmap(img_baseline:  np.ndarray,
                   img_optimized: np.ndarray,
                   ssim_map:      np.ndarray,
+                  edge_baseline: np.ndarray,
+                  edge_optimized: np.ndarray,
                   params:        dict):
     """
-    Build visual heatmap, detect degraded regions, and tag each region by
-    which analysis passes flagged it.
+    Build visual heatmap, detect degraded regions, and compute per-region
+    local scores for all three passes.
+
+    Local SSIM and edge scores are derived by slicing already-computed maps —
+    no redundant pipeline re-runs. Color is re-run on each crop (the only pass
+    without a dense spatial map).
 
     INPUTS:
-        img_baseline:  H × W × 3 float64 [0,1] — reference image
-        img_optimized: H × W × 3 float64 [0,1] — test image
-        ssim_map:      H × W float64 [0,1]      — per-pixel SSIM scores
+        img_baseline:   H × W × 3 float64 [0,1] — reference image
+        img_optimized:  H × W × 3 float64 [0,1] — test image
+        ssim_map:       H × W float64 [0,1]      — per-pixel SSIM scores
+        edge_baseline:  H × W uint8              — Canny map for baseline
+        edge_optimized: H × W uint8              — Canny map for optimized image
         params: Dictionary with keys:
             - 'heatmap_alpha':           Blend factor between heatmap and image
             - 'degradation_thresh':      Threshold for SSIM-based region detection
             - 'morph_radius':            Morphological closing radius (in pixels)
             - 'min_region_area':         Minimum bounding box area (in pixels²)
-            - 'canny_edge_match_thresh': Edge match threshold for per-region check
-            - 'color_distance_thresh':   Bhattacharyya threshold for per-region check
-            - (all other edge/color params forwarded to their respective passes)
+            - 'ssim_threshold':          SSIM pass threshold (for local verdict)
+            - 'canny_edge_match_thresh': Edge match threshold (for local verdict)
+            - 'color_distance_thresh':   Bhattacharyya threshold (for local verdict)
+            - (all color params forwarded to per-region color run)
 
     RETURNS:
-        (composite, tagged_boxes) tuple:
-        - composite:    H × W × 3 float64 image (heatmap + original blended)
-        - tagged_boxes: List of (x, y, w, h, flags) tuples where flags is a
-                        frozenset containing any of {'ssim', 'edge', 'color'}
+        (composite, combined_regions) tuple:
+        - composite:        H × W × 3 float64 image (heatmap + original blended)
+        - combined_regions: List of region dicts (schema described in module docstring)
     """
     # ========================================================================
     # STEP 1: Create degradation map
@@ -111,82 +132,111 @@ def build_heatmap(img_baseline:  np.ndarray,
     boxes = []
     for cnt in contours:
         if cv2.contourArea(cnt) > params['min_region_area']:
-            x, y, w, h = cv2.boundingRect(cnt)
-            boxes.append((x, y, w, h))
+            boxes.append(cv2.boundingRect(cnt))   # (x, y, w, h)
 
     # ========================================================================
-    # STEP 7: Per-region multi-pass tagging
+    # STEP 7: Per-region local scoring
     # ========================================================================
-    # For each SSIM-detected box, crop both images to that region and run
-    # localized edge and color checks. This tells us not just *where* the
-    # degradation is, but *which dimensions* of quality broke down there.
-    tagged_boxes = _tag_boxes(boxes, img_baseline, img_optimized, params)
+    # Compute local scores for each pass within each SSIM-detected bounding box.
+    # SSIM and edge use map slices (free). Color re-runs on the crop (necessary).
+    combined_regions = _score_regions(
+        boxes,
+        ssim_map,
+        edge_baseline,
+        edge_optimized,
+        img_baseline,
+        img_optimized,
+        params,
+    )
 
-    return composite, tagged_boxes
+    return composite, combined_regions
 
 
-def _tag_boxes(boxes:          list,
-               img_baseline:   np.ndarray,
-               img_optimized:  np.ndarray,
-               params:         dict) -> list:
+def _score_regions(boxes:          list,
+                   ssim_map:       np.ndarray,
+                   edge_baseline:  np.ndarray,
+                   edge_optimized: np.ndarray,
+                   img_baseline:   np.ndarray,
+                   img_optimized:  np.ndarray,
+                   params:         dict) -> list:
     """
-    Run localized edge and color checks within each bounding box region.
+    Compute per-region local scores for all three passes and return structured
+    combined region dicts.
 
-    For every box detected by SSIM, we crop both images to that region and
-    re-run the edge match and Bhattacharyya color distance on the crop alone.
-    This gives per-region attribution: which filters agree that this specific
-    area is degraded, not just the image as a whole.
-
-    SSIM is always in the flag set — boxes only exist because SSIM flagged them.
+    For SSIM and edge, local scores are derived by slicing already-computed
+    full-image maps — no extra pipeline computation. For color, a histogram
+    comparison is re-run on the cropped region (no dense spatial map exists).
 
     INPUTS:
-        boxes:         List of (x, y, w, h) tuples from SSIM region detection
-        img_baseline:  Full baseline image (H × W × 3, float64 [0,1])
-        img_optimized: Full optimized image (H × W × 3, float64 [0,1])
-        params:        Full params dict (forwarded to edge and color passes)
+        boxes:          List of (x, y, w, h) tuples from SSIM contour detection
+        ssim_map:       H × W float64 — full-image SSIM scores (from ssim_pass)
+        edge_baseline:  H × W uint8   — Canny map for baseline (from edge_pass)
+        edge_optimized: H × W uint8   — Canny map for optimized (from edge_pass)
+        img_baseline:   H × W × 3 float64 — full baseline image (for color crop)
+        img_optimized:  H × W × 3 float64 — full optimized image (for color crop)
+        params:         Full params dict
 
     RETURNS:
-        List of (x, y, w, h, flags) tuples where flags is a frozenset of
-        strings from {'ssim', 'edge', 'color'}
+        List of combined region dicts. See module docstring for schema.
     """
-    # Never save intermediates for per-region crops — they are diagnostic
-    # sub-calls, not primary pipeline outputs.
+    # Suppress intermediate saves for per-region color sub-calls —
+    # these are diagnostic crops, not primary pipeline outputs.
     crop_params = {**params, 'save_intermediates': False}
 
-    tagged = []
+    edge_thresh  = params['canny_edge_match_thresh']
+    ssim_thresh  = params['ssim_threshold']
+    color_thresh = params['color_distance_thresh']
+
+    combined_regions = []
+
     for (x, y, w, h) in boxes:
-        flags = {'ssim'}  # SSIM always present — it's why this box exists
+        passes_failed = ['ssim']  # SSIM always fires — it's why this box exists
 
-        # Crop both images to this region for localized analysis.
-        crop_base = img_baseline [y:y+h, x:x+w]
-        crop_opt  = img_optimized[y:y+h, x:x+w]
+        # ---- Local SSIM score: mean of ssim_map within bbox ----
+        # Free operation — just a numpy slice and mean.
+        ssim_crop   = ssim_map[y:y+h, x:x+w]
+        local_ssim  = float(np.mean(ssim_crop))
 
-        # Crops smaller than 3×3 can't support Sobel kernels or meaningful
-        # histograms, so we record the SSIM tag alone and move on.
-        if crop_base.shape[0] < 3 or crop_base.shape[1] < 3:
-            tagged.append((x, y, w, h, frozenset(flags)))
-            continue
+        # ---- Local edge score: match rate within bbox edge map slices ----
+        # Free operation — slices of the already-computed Canny maps.
+        local_edge  = None
+        if edge_baseline is not None and edge_optimized is not None:
+            eb_crop = edge_baseline [y:y+h, x:x+w]
+            eo_crop = edge_optimized[y:y+h, x:x+w]
+            baseline_count = np.count_nonzero(eb_crop)
+            if baseline_count > 0:
+                matched_count = np.count_nonzero(eb_crop & eo_crop)
+                local_edge    = float(matched_count / baseline_count)
+                # Edge FAILS locally when match rate drops below threshold
+                if local_edge < edge_thresh:
+                    passes_failed.append('edge')
+            # If no edges in this crop, edge pass is trivially satisfied — skip
 
-        # ---- Edge check ----
-        # Does this specific region also fail the edge match threshold?
-        try:
-            edge_r = run_edge(crop_base, crop_opt, crop_params)
-            if not edge_r['passed']:
-                flags.add('edge')
-        except Exception:
-            # Pathological crops (e.g., completely uniform) may produce no
-            # edges at all. Skip gracefully — SSIM tag is sufficient.
-            pass
+        # ---- Local color score: re-run histogram on the crop ----
+        # Color has no dense spatial map; histogram must be recomputed per crop.
+        # Skip crops too small to yield meaningful histograms.
+        local_color = None
+        if w >= 3 and h >= 3:
+            try:
+                crop_base = img_baseline [y:y+h, x:x+w]
+                crop_opt  = img_optimized[y:y+h, x:x+w]
+                color_r   = run_color(crop_base, crop_opt, crop_params)
+                local_color = color_r['score']
+                if not color_r['passed']:
+                    passes_failed.append('color')
+            except Exception:
+                # Pathological crops (e.g., fully uniform patches) may produce
+                # degenerate histograms. Skip gracefully — SSIM tag is sufficient.
+                pass
 
-        # ---- Color check ----
-        # Does this specific region also fail the Bhattacharyya threshold?
-        try:
-            color_r = run_color(crop_base, crop_opt, crop_params)
-            if not color_r['passed']:
-                flags.add('color')
-        except Exception:
-            pass
+        combined_regions.append({
+            "bbox":          (x, y, w, h),
+            "passes_failed": passes_failed,
+            "local_scores":  {
+                "ssim":  local_ssim,
+                "edge":  local_edge,
+                "color": local_color,
+            },
+        })
 
-        tagged.append((x, y, w, h, frozenset(flags)))
-
-    return tagged
+    return combined_regions
