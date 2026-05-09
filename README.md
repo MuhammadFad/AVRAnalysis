@@ -1,7 +1,5 @@
 # Visual Regression Analyzer
 
-**DIP Semester Project — May 2026**
-
 A multi-pass image quality analysis pipeline for detecting and diagnosing visual degradation in compressed video frames. The system compares a high-quality baseline frame against a compressed/optimized version across three independent perceptual dimensions — structural similarity, edge preservation, and color fidelity — then applies a deterministic truth table to assign a plain-English cause hypothesis to every degraded region it finds.
 
 ---
@@ -442,19 +440,3 @@ root/
 ```
 
 ---
-
-## Future Work
-
-The following extensions were scoped out of this project but are natural next steps for a Final Year Project:
-
-**Independent spatial detection per pass**
-Currently SSIM is the sole source of bounding boxes and edge/color are evaluated locally within each SSIM region. A richer approach would have the edge pass detect regions from the lost-edge map (contours on `baseline_edges ∩ ¬optimized_edges`) and the color pass use a tile-grid Bhattacharyya scan, then IoU-cluster all three region lists. The `IOU_THRESHOLD` config parameter is already in place for this.
-
-**LLM semantic reasoning layer**
-Batched region crops sent to a multimodal LLM for natural language description. The combinator currently produces rule-based hypotheses from a fixed truth table; an LLM layer could describe more nuanced artifacts (mosquito noise, banding gradients) that don't reduce cleanly to the three-pass schema.
-
-**UE5 segmentation pass**
-A custom depth/stencil render pass for per-object region tagging in game engine footage, enabling per-mesh degradation attribution rather than purely spatial bounding boxes.
-
-**Multi-view screenshot approach**
-Comparing the same scene from multiple camera angles to separate viewpoint-dependent artifacts (specular highlights, reflections) from genuine geometric or texture degradation.
