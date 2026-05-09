@@ -6,7 +6,7 @@ A Python pipeline for comparing a baseline image against an optimized version ac
 
 ## How it works
 
-The pipeline runs three analysis passes on the same image pair and aggregates their results into a set of reports.
+There is a sample baseline.png and optimized.png to start working, but this project does not ship with a dataset. You have two options:
 
 **SSIM** measures perceptual similarity by comparing local brightness, texture variation, and edge patterns between the two images. It produces a per-pixel score map, detects degraded regions, and tags each region with which other passes also flagged it.
 
