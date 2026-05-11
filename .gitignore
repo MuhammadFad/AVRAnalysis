@@ -1,7 +1,20 @@
-data/baseline/
-data/optimized/
-output/
+# Python
 venv/
 __pycache__/
 *.pyc
+*.pyo
 .env
+
+# Pipeline I/O
+data/baseline/
+data/optimized/
+output/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+
+# OS
+.DS_Store
+Thumbs.db
