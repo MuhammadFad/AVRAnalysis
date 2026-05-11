@@ -94,8 +94,8 @@ def load_images(baseline_path: str, optimized_path: str):
     if raw_b.ndim != 3 or raw_b.shape[2] != 3:
         raise ValueError("Images must be RGB (3 channels).")
 
-    img_b = cv2.cvtColor(raw_b, cv2.COLOR_BGR2RGB).astype(np.float64) / 255.0
-    img_o = cv2.cvtColor(raw_o, cv2.COLOR_BGR2RGB).astype(np.float64) / 255.0
+    img_b = cv2.cvtColor(raw_b, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    img_o = cv2.cvtColor(raw_o, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
     h, w, _ = img_b.shape
     print(f"  >> Images loaded: {w} x {h} pixels.")
