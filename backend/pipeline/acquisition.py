@@ -14,7 +14,7 @@
 import cv2
 import numpy as np
 
-MAX_IMAGE_DIM = 1920
+MAX_IMAGE_DIM = 1280
 
 
 def load_and_align(baseline_bytes: bytes, optimized_bytes: bytes):
@@ -22,12 +22,12 @@ def load_and_align(baseline_bytes: bytes, optimized_bytes: bytes):
     Decode, align, and normalize two images provided as raw bytes.
 
     Used by api.py — accepts bytes from UploadFile reads, decodes with OpenCV,
-    aligns dimensions if they differ, caps resolution, normalizes to float64.
+    aligns dimensions if they differ, caps resolution, normalizes to float32.
 
     RETURNS:
         (img_baseline, img_optimized, resolution_mismatch, orig_dims, analyzed_dims)
-        - img_baseline:         H × W × 3 float64 [0,1]
-        - img_optimized:        H × W × 3 float64 [0,1]
+        - img_baseline:         H × W × 3 float32 [0,1]
+        - img_optimized:        H × W × 3 float32 [0,1]
         - resolution_mismatch:  bool — True if the two uploads had different sizes
         - orig_dims:            {'baseline': [w,h], 'optimized': [w,h]}
         - analyzed_dims:        [w, h] after alignment + cap
@@ -67,9 +67,9 @@ def load_and_align(baseline_bytes: bytes, optimized_bytes: bytes):
 
     analyzed_dims = [b.shape[1], b.shape[0]]  # [w, h]
 
-    # BGR → RGB, uint8 → float64 [0, 1]
-    b = cv2.cvtColor(b, cv2.COLOR_BGR2RGB).astype(np.float64) / 255.0
-    o = cv2.cvtColor(o, cv2.COLOR_BGR2RGB).astype(np.float64) / 255.0
+    # BGR → RGB, uint8 → float32 [0, 1]
+    b = cv2.cvtColor(b, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    o = cv2.cvtColor(o, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
     return b, o, mismatch, orig_dims, analyzed_dims
 
