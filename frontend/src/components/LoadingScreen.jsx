@@ -19,11 +19,6 @@ export default function LoadingScreen({ elapsed }) {
         <p className="font-mono text-dim text-sm tracking-widest uppercase">
           turning the lights on{dots}&nbsp;
         </p>
-        {elapsed > 5 && (
-          <p className="font-mono text-muted text-xs mt-2 animate-fade-in">
-            render free tier cold start — usually ~20s
-          </p>
-        )}
         {elapsed > 0 && (
           <p className="font-mono text-muted/60 text-xs mt-1">
             {elapsed}s elapsed
