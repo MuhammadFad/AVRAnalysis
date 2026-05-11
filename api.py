@@ -30,8 +30,8 @@ app = FastAPI(title="AVR — Visual Regression Analyzer API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Tighten to Vercel URL before production
-    allow_methods=["*"],
+    allow_origins=["https://avra-1qw5.onrender.com"],   # Vercel URL
+    allow_methods=["http://localhost:5173"],
     allow_headers=["*"],
 )
 

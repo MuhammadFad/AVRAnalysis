@@ -4,7 +4,7 @@ A three-pass image quality analysis pipeline that compares a baseline frame agai
 an optimized version, detects degraded regions, and assigns a plain-English cause
 hypothesis to each one. Available as a hosted web app and a local CLI tool.
 
-**Live app → [your-app.vercel.app](https://your-app.vercel.app)**
+**Live app → [https://avr-analysis.vercel.app/](https://avr-analysis.vercel.app/)**
 
 ---
 
